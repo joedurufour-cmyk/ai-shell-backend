@@ -29,7 +29,7 @@ PLANS = {
 # ── Gemini init ─────────────────────────────────────────
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash")
 else:
     gemini_model = None
 
@@ -234,4 +234,3 @@ def admin_revoke(key: str, secret: str = ""):
         db.execute("UPDATE licenses SET active=0 WHERE key=?", (key.upper(),))
         db.commit()
     return {"revoked": key}
-    
