@@ -8,9 +8,13 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import google.generativeai as genai
+
+# ── Config ──────────────────────────────────────────────
 STRIPE_WEBHOOK   = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 ADMIN_SECRET     = os.getenv("ADMIN_SECRET", "changeme123")
 DB_PATH          = os.getenv("DB_PATH", "licenses.db")
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
 
 PRICE_MONTHLY    = os.getenv("STRIPE_PRICE_MONTHLY", "price_xxx")
 PRICE_YEARLY     = os.getenv("STRIPE_PRICE_YEARLY", "price_xxx")
@@ -22,6 +26,14 @@ PLANS = {
     PRICE_LIFETIME: {"plan": "pro", "days": 99999, "label": "lifetime"},
 }
 
+# ── Gemini init ─────────────────────────────────────────
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+else:
+    gemini_model = None
+
+# ── App ─────────────────────────────────────────────────
 app = FastAPI(title="AI Shell License API")
 
 app.add_middleware(
@@ -31,6 +43,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── DB ──────────────────────────────────────────────────
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -56,6 +69,7 @@ def init_db():
 
 init_db()
 
+# ── Helpers ─────────────────────────────────────────────
 def generate_key(prefix="AISH") -> str:
     raw = str(uuid.uuid4()).replace("-", "").upper()
     parts = [raw[i:i+4] for i in range(0, 16, 4)]
@@ -73,6 +87,21 @@ def create_license(plan, days, email="", stripe_id="", label="") -> str:
         db.commit()
     return key
 
+def is_valid_license(key: str) -> bool:
+    with get_db() as db:
+        row = db.execute("SELECT * FROM licenses WHERE key = ?", (key.strip().upper(),)).fetchone()
+    if not row or not row["active"]:
+        return False
+    expires = row["expires_at"]
+    if expires and expires != "lifetime":
+        try:
+            if datetime.fromisoformat(expires) < datetime.utcnow():
+                return False
+        except Exception:
+            pass
+    return True
+
+# ── Models ──────────────────────────────────────────────
 class ValidateRequest(BaseModel):
     key: str
 
@@ -83,9 +112,15 @@ class ManualKeyRequest(BaseModel):
     label: str = ""
     admin_secret: str
 
+class ChatRequest(BaseModel):
+    key: str
+    message: str
+    history: list = []   # [{"role": "user"|"model", "parts": "..."}]
+
+# ── Endpoints ────────────────────────────────────────────
 @app.get("/")
 def root():
-    return {"status": "AI Shell License API online", "version": "1.0"}
+    return {"status": "AI Shell License API online", "version": "2.0"}
 
 @app.post("/api/validate-key")
 def validate_key(req: ValidateRequest):
@@ -112,6 +147,32 @@ def validate_key(req: ValidateRequest):
         "label": row["label"] or "pro",
         "email": row["email"] or "",
     }
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    # 1. Validar licencia
+    if not is_valid_license(req.key):
+        raise HTTPException(status_code=403, detail="Licencia inválida o expirada")
+
+    # 2. Verificar Gemini disponible
+    if not gemini_model:
+        raise HTTPException(status_code=503, detail="Gemini API key no configurada")
+
+    # 3. Construir historial
+    history = []
+    for msg in req.history:
+        role = msg.get("role", "user")
+        parts = msg.get("parts", "")
+        if role in ("user", "model") and parts:
+            history.append({"role": role, "parts": parts})
+
+    # 4. Llamar a Gemini
+    try:
+        chat_session = gemini_model.start_chat(history=history)
+        response = chat_session.send_message(req.message)
+        return {"reply": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
 
 @app.post("/api/webhook")
 async def stripe_webhook(request: Request):
@@ -173,3 +234,4 @@ def admin_revoke(key: str, secret: str = ""):
         db.execute("UPDATE licenses SET active=0 WHERE key=?", (key.upper(),))
         db.commit()
     return {"revoked": key}
+    
